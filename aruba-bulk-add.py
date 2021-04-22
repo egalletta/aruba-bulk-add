@@ -5,20 +5,32 @@ import getpass
 from typing import Tuple
 import os
 import csv
-import multiprocessing
+import sys
 import time
 import pprint
 
 MANAGEMENT_IP = None
 
 
-def login() -> Tuple[str, str]:
+def login() -> (str, str):
+    """
+    Presents the login interface with non-echo password field
+    :returns: tuple containing username, password
+    """
+    print(f"Logging in to {MANAGEMENT_IP}")
     username = input("Enter your username:\n> ")
     password = getpass.getpass("Enter your password:\n> ")
     return username, password
 
 
 def setup_ssh(uname: str, pword: str) -> paramiko.SSHClient:
+    """
+    Logs into the host specied by the global MANAGEMENT_IP
+    :param uname: username to authenticate with
+    :param pword: password to authenticate with
+    :returns: an authenticated SSH client.
+
+    """
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -28,18 +40,37 @@ def setup_ssh(uname: str, pword: str) -> paramiko.SSHClient:
 
 
 def str_grouper(n, iterable):
+    """
+    Assists in formatting mac addresses by splitting string into chunks of size n
+    :param n: numbers of characters per chunk
+    :param iterable: source string
+    :returns: the string, group into size n chunks
+
+    """
     args = [iter(iterable)] * n
     for part in zip(*args):
         yield "".join(part)
 
 
 def convert_mac(mac: str) -> str:
+    """
+    Converts a potentially ill-formatted MAC address into a properly formatted one.
+    :param mac: Potentially ill-formatted MAC address
+    :returns:  Properly formatted MAC address
+
+    """
     if ":" in mac:
         return mac
     return ":".join(str_grouper(2, mac.lower()))
 
 
 def print_stream(s) -> str:
+    """
+    Prints a stream to stdout
+    :param s: The input stream
+    :returns: A string, containing the contents of the passed stream.
+
+    """
     res = ""
     for line in iter(s.readline, ""):
         res += line
@@ -48,6 +79,13 @@ def print_stream(s) -> str:
 
 
 def stream2str(s) -> str:
+    """
+    Converts a stream/file-like object to a string
+    :param s: Stream to convert
+    :returns: Stream in string form
+
+    """
+
     res = ""
     for line in iter(s.readline, ""):
         res += line
@@ -80,6 +118,11 @@ def create_table(
             continue
         attrs = ap.split()
         name = attrs[0]
+        # Remove "-OLD"/"old" suffixes on existing AP names
+        if name[-4:].lower() == "-old":
+            name = name[:-4]
+        elif name[-3:].lower() == "old":
+            name = name[:-3]
         with open(path, "a", newline="") as f:
             writer = csv.writer(f, delimiter=",")
             if interactive_mac:
@@ -90,6 +133,13 @@ def create_table(
 
 
 def write_conf_csv(client: paramiko.SSHClient):
+    """
+    Handles getting user input and information about creating or appending to a
+    .csv file that can be later used to rename/regroup access points.
+    :param client: an authenticated SSH client
+    :returns: None
+
+    """
     path = input("Enter the path of the .csv file to be used for configuration:\n> ")
     group = ""
     while group != "exit":
@@ -99,8 +149,8 @@ def write_conf_csv(client: paramiko.SSHClient):
         if group.lower() == "exit":
             break
         prompt = (
-            "Would you like to interactively add AP MAC addresses for group\n"
-            f"{group}, or just leave the MAC field in the .csv blank?\n\n"
+            "Would you like to interactively add AP MAC addresses now for group"
+            f"{group}?\n\n"
             "   1) Enter MAC addresses interactively\n"
             "   2) Do not add MAC addresses at this time\n"
             "   3) Exit\n"
@@ -116,6 +166,36 @@ def write_conf_csv(client: paramiko.SSHClient):
 
 
 def apply_conf_csv(client: paramiko.SSHClient):
+    """
+    Prompts for user input regarding which .csv configuration file to use,
+    and then attempts to bulk rename and regroup all of the access points in the
+    .csv
+
+    The configuration .csv should have the form:
+
+    group,name,mac
+    group_of_ap,name_of_ap,mac_of_ap
+    group_of_ap,name_of_ap,mac_of_ap
+    ...
+    group_of_ap,name_of_ap,mac_of_ap
+
+    This function will go through each row, and attempt to rename and regroup
+    the access point with the specified mac address, and set its group and name
+    to the ones specified in the .csv file. If the Aruba Controller cannot find
+    a connected AP with the specified MAC address, no action will be taken.
+    However, if an AP with the specified MAC address is found, this AP will be
+    regrouped and renamed via the Aruba Controller, which will cause the AP to
+    reboot. Additionally, its row in the .csv file will be deleted, such that
+    only APs that still need to be renamed will be present in the .csv file.
+
+    This function will terminate when all APs in the .csv file are
+    regrouped/renamed, or when the user signals a KeyboardInterrupt using Control-C
+
+    :param client: an authenticated SSH client
+    :returns: None
+
+    """
+
     path = input("Enter the path of the .csv file to be used for configuration:\n> ")
     print("Attempting to configure access points.\nPress C-c to stop.")
     try:
@@ -127,8 +207,13 @@ def apply_conf_csv(client: paramiko.SSHClient):
                 reader = csv.DictReader(f, delimiter=",")
                 for row in reader:
                     todo.append(row)
+            if len(todo) < 1:
+                print("Requested APs have been renamed.")
+                break
             for ap in todo:
                 mac = convert_mac(ap["mac"])
+                if len(mac) < 10:
+                    continue  # ignore blank/bad lines
                 ap_name = ap["name"]
                 group = ap["group"]
                 # Verify AP is found:
@@ -157,19 +242,19 @@ def apply_conf_csv(client: paramiko.SSHClient):
                     writer.writerow([ap["group"], ap["name"], ap["mac"]])
             os.rename(path + ".swp", path)
             if len(still_needed) > 0:
-                print("Could not rename the following APs (are the APs online?):\n")
-                pprint.pprint(still_needed)
+                print("\n\nCould not rename the following APs (are the APs online?):")
+                pprint.pprint([x["name"] for x in still_needed])
+                print("Trying again in 10s...")
                 time.sleep(10)
-                print("Trying again...")
+
     except KeyboardInterrupt:
-        print("Stopping\n")
+        print("Stopping...\n")
 
 
 if __name__ == "__main__":
-
     if MANAGEMENT_IP == None:
         print(
-            "No IP address set.\nPlease set Aruba Management IP in line 7\n\n\tExample: MANAGEMENT_IP = '10.0.0.1'"
+            f"No IP address set.\nPlease set Aruba Management IP in {sys.argv[0]}\n\n\tExample: MANAGEMENT_IP = '10.0.0.1'"
         )
         exit(1)
     username, password = login()
